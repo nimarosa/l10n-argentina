@@ -120,7 +120,8 @@
                     <field name="local" invisible="1"/>
                 </field>
                 <field name="fiscal_position" position="after">
-                        <field name="dst_cuit_id" widget="selection" attrs="{'invisible': [('local','=', True)]}"/>
+                    <field name="dst_cuit_id" widget="selection"
+                        attrs="{'invisible': [('local','=', True)]}"/>
                 </field>
             </field>
         </record>

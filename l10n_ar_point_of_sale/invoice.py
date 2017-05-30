@@ -458,7 +458,7 @@ class invoice(osv.osv):
                 #para las invoices de suppliers
                 if type in ['in_invoice', 'in_refund', 'in_debit']:
                     denom_sup_id = fiscal_pool.browse(cr, uid , fiscal_position_id).denom_supplier_id.id
-                    res['value'].update({'denomination_id': denom_sup_id})
+                    res['value'].update({'denomination_id': denom_sup_id, 'local': fiscal_position.local})
                 #para las customers invoices
                 else:
                     pos = pos_pool.search( cr, uid , [('denomination_id','=',denomination_id)], order='priority asc', limit=1 )
