@@ -2,23 +2,18 @@
 # For copyright and license notices, see __manifest__.py file in module root
 # directory
 ##############################################################################
-try:
-    from base64 import encodebytes
-except ImportError:  # 3+
-    from base64 import encodestring as encodebytes
-
-import logging
 import re
-from ast import literal_eval
 
-from odoo import _, fields, models
+from odoo import _, api, fields, models
 from odoo.exceptions import ValidationError
 
-_logger = logging.getLogger(__name__)
+try:
+    from base64 import encodebytes
+except ImportError:
+    from base64 import encodestring as encodebytes
 
 
 class AccountVatLedger(models.Model):
-
     _name = "account.vat.ledger"
     _description = "Account VAT Ledger"
     _inherit = ["mail.thread"]
@@ -46,10 +41,6 @@ class AccountVatLedger(models.Model):
         "REGDIGITAL_CV_CBTE",
         readonly=True,
     )
-    REGDIGITAL_CV_CABECERA = fields.Text(
-        "REGDIGITAL_CV_CABECERA",
-        readonly=True,
-    )
     digital_vouchers_file = fields.Binary(
         "Digital Voucher File", compute="_compute_digital_files", readonly=True
     )
@@ -74,17 +65,8 @@ class AccountVatLedger(models.Model):
         compute="_compute_digital_files",
     )
     prorate_tax_credit = fields.Boolean("Prorate Tax Credit")
-
-    company_id = fields.Many2one(
-        "res.company",
-        string="Company",
-        required=True,
-        readonly=True,
-        states={"draft": [("readonly", False)]},
-        default=lambda self: self.env["res.company"]._company_default_get(
-            "account.vat.ledger"
-        ),
-    )
+    name = fields.Char("Name", compute="_compute_name")
+    reference = fields.Char("Reference")
     type = fields.Selection(
         [("sale", "Sale"), ("purchase", "Purchase")], "Type", required=True
     )
@@ -110,294 +92,287 @@ class AccountVatLedger(models.Model):
         readonly=True,
         states={"draft": [("readonly", False)]},
     )
-    presented_ledger = fields.Binary(
-        "Presented Ledger",
-        readonly=True,
-        states={"draft": [("readonly", False)]},
+    invoice_ids = fields.Many2many(
+        "account.move", string="Invoices", compute="_compute_invoices"
     )
-    presented_ledger_name = fields.Char("Presented Ledger Name")
+    attachment_ids = fields.Many2many(comodel_name="ir.attachment", string="Adjuntos")
     state = fields.Selection(
         [("draft", "Draft"), ("presented", "Presented"), ("cancel", "Cancelled")],
         "State",
         required=True,
         default="draft",
     )
-    note = fields.Html("Note")
-
-    name = fields.Char("Name", compute="_compute_name")
-    reference = fields.Char("Reference")
-    invoice_ids = fields.Many2many(
-        "account.move", string="Invoices", compute="_compute_data"
+    company_id = fields.Many2one(
+        "res.company",
+        string="Company",
+        required=True,
+        readonly=True,
+        states={"draft": [("readonly", False)]},
+        default=lambda self: self.env["res.company"]._company_default_get(
+            "account.vat.ledger"
+        ),
     )
 
-    def _compute_data(self):
-        if self.type == "sale":
-            invoices_domain = [
-                ("state", "not in", ["draft", "cancel"]),
-                ("document_number", "!=", False),
-                ("journal_id", "in", self.journal_ids.ids),
-                ("date", ">=", self.date_from),
-                ("date", "<=", self.date_to),
-            ]
-            invoices = self.env["account.move"].search(
-                invoices_domain, order="invoice_date asc, document_number asc, id asc"
+    def _compute_name(self):
+        for record in self:
+            ledger_type = _("IVA Ventas") if record.type == "sale" else _("IVA Compras")
+            date_from_str = (
+                fields.Date.from_string(record.date_from).strftime("%d/%m/%Y")
+                if record.date_from
+                else ""
             )
-        else:
-            invoices_domain = [
+            date_to_str = (
+                fields.Date.from_string(record.date_to).strftime("%d/%m/%Y")
+                if record.date_to
+                else ""
+            )
+            name = _("%s / Periodo: %s - %s") % (
+                ledger_type,
+                date_from_str,
+                date_to_str,
+            )
+            if record.reference:
+                name = f"{name} (Ref.: {record.reference})"
+            record.name = name
+
+    @api.depends("journal_ids", "date_from", "date_to")
+    def _compute_invoices(self):
+        self.invoice_ids = self.env["account.move"].search(
+            [
                 ("state", "not in", ["draft", "cancel"]),
                 ("name", "!=", False),
                 ("journal_id", "in", self.journal_ids.ids),
                 ("date", ">=", self.date_from),
                 ("date", "<=", self.date_to),
-            ]
-            invoices = self.env["account.move"].search(
-                invoices_domain, order="invoice_date asc, name asc, id asc"
-            )
+            ],
+            order="invoice_date asc, name asc, id asc",
+        )
 
-        self.invoice_ids = invoices
-
-    def format_amount(self, amount, padding=15, decimals=2, invoice=False):
-        # Fet amounts on correct sign despite conifiguration on taxes and tax
-        # codes
-        if (
-            invoice
-            and invoice.l10n_latam_document_type_id.code
-            in ["39", "40", "41", "66", "99"]
-            and invoice.move_type in ["in_refund", "out_refund"]
-        ):
-            amount = -amount
-
-        if amount < 0:
-            template = "-{:0>%dd}" % (padding - 1)
-        else:
-            template = "{:0>%dd}" % (padding)
-        return template.format(int(round(abs(amount) * 10**decimals, decimals)))
-
-    def _compute_name(self):
-        for rec in self:
-            if rec.type == "sale":
-                ledger_type = _("Sales")
-            elif rec.type == "purchase":
-                ledger_type = _("Purchases")
-
-            name = _("%s VAT Ledger %s - %s") % (
-                ledger_type,
-                rec.date_from
-                and fields.Date.from_string(rec.date_from).strftime("%d-%m-%Y")
-                or "",
-                rec.date_to
-                and fields.Date.from_string(rec.date_to).strftime("%d-%m-%Y")
-                or "",
-            )
-            if rec.reference:
-                name = "%s - %s" % (name, rec.reference)
-            rec.name = name
+    # def _compute_digital_files(self):
+    #     self.ensure_one()
+    #     if self.REGDIGITAL_CV_ALICUOTAS:
+    #         self.digital_aliquots_filename = _("%s_ALICUOTAS_%s.txt") % (
+    #             self.type == "sale" and "VENTAS" or "COMPRAS",
+    #             self.date_to.strftime("%Y-%m"),
+    #         )
+    #         self.digital_aliquots_file = encodebytes(
+    #             self.REGDIGITAL_CV_ALICUOTAS.encode("ISO-8859-1")
+    #         )
+    #     else:
+    #         self.digital_aliquots_file = False
+    #         self.digital_aliquots_filename = False
+    #     if self.REGDIGITAL_CV_COMPRAS_IMPORTACIONES:
+    #         self.digital_import_aliquots_filename = _("%s_ALIC_IMPO_%s.txt") % (
+    #             self.type == "sale" and "VENTAS" or "COMPRAS",
+    #             self.date_to.strftime("%Y-%m"),
+    #         )
+    #         self.digital_import_aliquots_file = encodebytes(
+    #             self.REGDIGITAL_CV_COMPRAS_IMPORTACIONES.encode("ISO-8859-1")
+    #         )
+    #     else:
+    #         self.digital_import_aliquots_file = False
+    #         self.digital_import_aliquots_filename = False
+    #     if self.REGDIGITAL_CV_CBTE:
+    #         self.digital_vouchers_filename = _("%s_CBTES_%s.txt") % (
+    #             self.type == "sale" and "VENTAS" or "COMPRAS",
+    #             self.date_to.strftime("%Y-%m"),
+    #         )
+    #         self.digital_vouchers_file = encodebytes(
+    #             self.REGDIGITAL_CV_CBTE.encode("ISO-8859-1")
+    #         )
+    #     else:
+    #         self.digital_vouchers_file = False
+    #         self.digital_vouchers_filename = False
 
     def _compute_digital_files(self):
         self.ensure_one()
-        # AFIP Wait "ISO-8859-1" and not utf-8
-        # http://www.planillasutiles.com.ar/2015/08/como-descargar-los-archivos-de.html
-        if self.REGDIGITAL_CV_ALICUOTAS:
-            self.digital_aliquots_filename = _("Alicuots_%s_%s.txt") % (
-                self.type,
-                self.date_to,
-            )
-            self.digital_aliquots_file = encodebytes(
-                self.REGDIGITAL_CV_ALICUOTAS.encode("ISO-8859-1")
-            )
-        else:
-            self.digital_aliquots_file = False
-            self.digital_aliquots_filename = False
-        if self.REGDIGITAL_CV_COMPRAS_IMPORTACIONES:
-            self.digital_import_aliquots_filename = _("Import_Alicuots_%s_%s.txt") % (
-                self.type,
-                self.date_to,
-            )
-            self.digital_import_aliquots_file = encodebytes(
-                self.REGDIGITAL_CV_COMPRAS_IMPORTACIONES.encode("ISO-8859-1")
-            )
-        else:
-            self.digital_import_aliquots_file = False
-            self.digital_import_aliquots_filename = False
-        if self.REGDIGITAL_CV_CBTE:
-            self.digital_vouchers_filename = _("Vouchers_%s_%s.txt") % (
-                self.type,
-                self.date_to,
-            )
-            self.digital_vouchers_file = encodebytes(
-                self.REGDIGITAL_CV_CBTE.encode("ISO-8859-1")
-            )
-        else:
-            self.digital_vouchers_file = False
-            self.digital_vouchers_filename = False
+        file_type = "VENTAS" if self.type == "sale" else "COMPRAS"
+        date_str = self.date_to.strftime("%Y-%m")
+
+        def update_file_properties(file_content, file_name_attr, file_attr):
+            if file_content:
+                setattr(
+                    self,
+                    file_name_attr,
+                    _(f"{file_type}_{file_name_attr}_{date_str}.txt"),
+                )
+                setattr(self, file_attr, encodebytes(file_content.encode("ISO-8859-1")))
+            else:
+                setattr(self, file_name_attr, False)
+                setattr(self, file_attr, False)
+
+        update_file_properties(
+            self.REGDIGITAL_CV_ALICUOTAS,
+            "digital_aliquots_filename",
+            "digital_aliquots_file",
+        )
+        update_file_properties(
+            self.REGDIGITAL_CV_COMPRAS_IMPORTACIONES,
+            "digital_import_aliquots_filename",
+            "digital_import_aliquots_file",
+        )
+        update_file_properties(
+            self.REGDIGITAL_CV_CBTE,
+            "digital_vouchers_filename",
+            "digital_vouchers_file",
+        )
 
     def compute_digital_data(self):
-        alicuotas = self.get_REGDIGITAL_CV_ALICUOTAS()
-        lines = []
-        for v, v in alicuotas.items():
-            lines += v
-        self.REGDIGITAL_CV_ALICUOTAS = "\r\n".join(lines)
+        invoices = self.get_digital_invoices()
+        self._check_partners(invoices)
+        self._build_LID_ALIC(invoices)
+        self._build_LID_CBTE(invoices)
 
-        impo_alicuotas = {}
-        if self.type == "purchase":
-            impo_alicuotas = self.get_REGDIGITAL_CV_ALICUOTAS(impo=True)
-            lines = []
-            for v, v in impo_alicuotas.items():
-                lines += v
-            self.REGDIGITAL_CV_COMPRAS_IMPORTACIONES = "\r\n".join(lines)
-        alicuotas.update(impo_alicuotas)
-        self.get_REGDIGITAL_CV_CBTE()
-
-    def get_point_of_sale(self, invoice):
-        if self.type == "sale":
-            return "{:0>5d}".format(invoice.journal_id.l10n_ar_afip_pos_number)
-        else:
-            return invoice.l10n_latam_document_number[:5]
-
-    def get_partner_document_code(self, partner):
-        if partner.l10n_ar_afip_responsibility_type_id.code == "5":
-            res = str(
-                partner.l10n_latam_identification_type_id.l10n_ar_afip_code
-            ).zfill(2)
-            return res
-        return "80"
-
-    def get_partner_document_number(self, partner):
-        if partner.l10n_ar_afip_responsibility_type_id.code == "5":
-            number = partner.vat or ""
-            number = re.sub("[^0-9]", "", number)
-        else:
-            number = partner.vat
-        if number is not False:
-            return number.rjust(20, "0")
-        else:
-            raise ValidationError(
-                _(
-                    "Partner "
-                    + partner.name
-                    + " has not CUIT/CUIL or DNI. Required fro VAT Ledger Book."
-                )
-            )
-
-    def get_digital_invoices(self, return_skiped=False):
+    def _build_LID_ALIC(self, invoices):
         self.ensure_one()
-        invoices = self.env["account.move"].search(
-            [
-                ("l10n_latam_document_type_id.export_to_digital", "=", True),
-                ("id", "in", self.invoice_ids.ids),
-            ],
-            order="invoice_date asc",
-        )
-        if self.digital_skip_lines:
-            skip_lines = literal_eval(self.digital_skip_lines)
-            if isinstance(skip_lines, int):
-                skip_lines = [skip_lines]
-            to_skip = invoices.browse()
-            for line in skip_lines:
-                to_skip += invoices[line - 1]
-            if return_skiped:
-                return to_skip
-            invoices -= to_skip
-        return invoices
+        result = []
+        result_impo_purchases = []
 
-    def get_tax_row(self, invoice, base, code, tax_amount, impo=False):
-        self.ensure_one()
-        inv = invoice
-        if self.type == "sale":
-            doc_number = int(inv.name.split("-")[2])
-            row = [
-                # Campo 1: Tipo de Comprobante
-                "{:0>3d}".format(int(inv.l10n_latam_document_type_id.code)),
-                # Campo 2: Punto de Venta
-                self.get_point_of_sale(inv),
-                # Campo 3: Número de Comprobante
-                "{:0>20d}".format(doc_number),
-                # Campo 4: Importe Neto Gravado
-                self.format_amount(base, invoice=inv),
-                # Campo 5: Alícuota de IVA.
-                str(code).rjust(4, "0"),
-                # Campo 6: Impuesto Liquidado.
-                self.format_amount(tax_amount, invoice=inv),
-            ]
-        elif impo:
-            row = [
-                # Campo 1: Despacho de importación.
-                (inv.document_number or inv.number or "").rjust(16, "0"),
-                # Campo 2: Importe Neto Gravado
-                self.format_amount(base, invoice=inv),
-                # Campo 3: Alícuota de IVA
-                str(code).rjust(4, "0"),
-                # Campo 4: Impuesto Liquidado.
-                self.format_amount(tax_amount, invoice=inv),
-            ]
-        else:
-            doc_number = int(inv.name.split("-")[2])
-            row = [
-                # Campo 1: Tipo de Comprobante
-                str(inv.l10n_latam_document_type_id.code).zfill(3),
-                # Campo 2: Punto de Venta
-                "{:0>5d}".format(
-                    int(
-                        inv.l10n_latam_document_number[
-                            : inv.l10n_latam_document_number.find("-")
+        for invoice in invoices:
+            for tax in invoice._get_vat():
+                row = []
+
+                if self.type == "purchase":
+                    if invoice.l10n_latam_document_type_id == "66":
+                        impo_purchase_row = [
+                            (invoice.l10n_latam_document_number or "").rjust(16, "0"),
+                            self.format_amount(tax["BaseImp"]),
+                            str(tax["Id"]),
+                            self.format_amount(tax["Importe"]),
+                        ]
+                        result_impo_purchases.append(impo_purchase_row)
+                    else:
+                        row.extend(
+                            [
+                                str(invoice.l10n_latam_document_type_id.code).zfill(3),
+                                self.get_point_of_sale(invoice),
+                                "{:0>20d}".format(int(invoice.name.split("-")[2])),
+                                self.get_partner_document_code(
+                                    invoice.commercial_partner_id
+                                ),
+                                self.get_partner_document_number(
+                                    invoice.commercial_partner_id
+                                ),
+                            ]
+                        )
+                else:
+                    row.extend(
+                        [
+                            "{:0>3d}".format(
+                                int(invoice.l10n_latam_document_type_id.code)
+                            ),
+                            self.get_point_of_sale(invoice),
+                            "{:0>20d}".format(int(invoice.name.split("-")[2])),
                         ]
                     )
-                ),
-                # Campo 3: Número de Comprobante
-                "{:0>20d}".format(doc_number),
-                # Campo 4: Código de documento del vendedor
-                self.get_partner_document_code(inv.commercial_partner_id),
-                # Campo 5: Número de identificación del vendedor
-                self.get_partner_document_number(inv.commercial_partner_id),
-                # Campo 4: Importe Neto Gravado
-                self.format_amount(base, invoice=inv),
-                # Campo 5: Alícuota de IVA.
-                str(code).rjust(4, "0"),
-                # Campo 6: Impuesto Liquidado.
-                self.format_amount(tax_amount, invoice=inv),
-            ]
-        return row
-
-    def get_REGDIGITAL_CV_ALICUOTAS(self, impo=False):
-        # Get Aliquots
-        self.ensure_one()
-        res = {}
-        # Only vat taxes with codes 3, 4, 5, 6, 8, 9
-        # http://contadoresenred.com/regimen-de-informacion-de-
-        # compras-y-ventas-rg-3685-como-cargar-la-informacion/
-
-        if impo:
-            invoices = self.get_digital_invoices().filtered(
-                lambda r: r.l10n_latam_document_type_id.code == "66"
-                and r.state != "cancel"
-            )
-        else:
-            invoices = self.get_digital_invoices().filtered(
-                lambda r: r.l10n_latam_document_type_id.code
-                not in ["66", "11", "12", "13"]
-                and r.state != "cancel"
-            )
-
-        for inv in invoices:
-            vat_taxes = inv._get_vat()
-            lines = []
-
-            for tax in vat_taxes:
-                lines.append(
-                    "".join(
-                        self.get_tax_row(
-                            inv,
-                            tax["BaseImp"],
-                            tax["Id"],
-                            tax["Importe"],
-                            impo=impo,
-                        )
-                    )
+                row.extend(
+                    [
+                        self.format_amount(tax["BaseImp"]),
+                        "{:0>4d}".format(int(tax["Id"])),
+                        self.format_amount(tax["Importe"]),
+                    ]
                 )
-            res[inv] = lines
-        return res
+            result.append("".join(row))
+        self.REGDIGITAL_CV_ALICUOTAS = "\r\n".join(result)
+        self.REGDIGITAL_CV_COMPRAS_IMPORTACIONES = "\r\n".join(result_impo_purchases)
 
-    # REGDIGITAL_CV_CBTE Methods
+    def _build_LID_CBTE(self, invoices):
+        self.ensure_one()
+        result = []
+        for inv in invoices:
+            invoice_document_number = int(inv.name.split("-")[2])
+            invoice_amounts = inv._l10n_ar_get_amounts()
+            row = [
+                # Ventas/Compras - Campo 1: Fecha de comprobante
+                fields.Date.from_string(inv.invoice_date).strftime("%Y%m%d"),
+                # Ventas/Compras - Campo 2: Tipo de Comprobante
+                "{:0>3d}".format(int(inv.l10n_latam_document_type_id.code)),
+                # Ventas/Compras - Campo 3: Punto de venta
+                self.get_point_of_sale(inv),  # TODO: Ver
+                # Ventas/Compras - Campo 4: Número de Comprobante
+                # TODO: Ver el metodo para obtenerlo
+                "{:0>20d}".format(invoice_document_number),
+            ]
+            if self.type == "purchase":
+                # Compras - Campo 5: Despacho de importacion
+                row.append(
+                    (inv.l10n_latam_document_number or inv.number or "").rjust(16, "0")
+                ),  # TODO: Ver el metodo para obtenerlo
+            else:
+                # Ventas - Campo 5: Numero de comprobante hasta
+                row.append("{:0>20d}".format(invoice_document_number)),
+            row += [
+                # Ventas/Compras - Campo 6: Código de documento del vendedor/comprador
+                self.get_partner_document_code(inv.commercial_partner_id),
+                # Ventas/Compras Campo 7: Número de Identificación del vendedor/comprador
+                self.get_partner_document_number(inv.commercial_partner_id),
+                # Ventas/Compras Campo 8: Apellido y Nombre del vendedor.
+                inv.commercial_partner_id.name.ljust(30, " ")[:30],
+                # Ventas/Compras Campo 9: Importe Total de la Operación
+                self.format_amount(inv.amount_total),
+            ]
+            if self.type == "sale":
+                row += [
+                    # Ventas - Campo 10: Importe no gravado
+                    self.format_amount(invoice_amounts["vat_untaxed_base_amount"]),
+                    # Ventas - Campo 11: Percepcion a no categorizados - TODO: No implementado
+                    self.format_amount(0),
+                    # Ventas - Campo 12: Importe de operaciones exentas
+                    self.format_amount(invoice_amounts["vat_exempt_base_amount"]),
+                    # Ventas - Campo 13: Importe de percepciones impuestos nacionales
+                    self.format_amount(invoice_amounts["profits_perc_amount"]),
+                    # Ventas - Campo 14: Importe de percepciones de ingresos brutos
+                    self.format_amount(invoice_amounts["iibb_perc_amount"]),
+                ]
+            else:
+                row += [
+                    # Compras - Campo 10: Importe no gravado
+                    self.format_amount(invoice_amounts["vat_untaxed_base_amount"]),
+                    # Compras - Campo 11: Importe de operaciones exentas
+                    self.format_amount(invoice_amounts["vat_exempt_base_amount"]),
+                    # Compras - Campo 12: Importe de percecpiones de IVA
+                    self.format_amount(invoice_amounts["vat_perc_amount"]),
+                    # Compras - Campo 13: Importe de percepciones impuestos nacionales
+                    self.format_amount(invoice_amounts["profits_perc_amount"]),
+                    # Compras - Campo 14: Importe de percepciones de ingresos brutos
+                    self.format_amount(invoice_amounts["iibb_perc_amount"]),
+                ]
+            row += [
+                # Ventas/Compras - Campo 15: Importe de percepciones de impuestos municipales
+                self.format_amount(invoice_amounts["mun_perc_amount"]),
+                # Ventas/Compras - Campo 16: Importe de impuestos internos
+                self.format_amount(invoice_amounts["intern_tax_amount"]),
+                # Ventas/Compras - Campo 17: Código de Moneda
+                inv.currency_id.l10n_ar_afip_code,
+                # Ventas/Compras - Campo 18: Tipo de Cambio
+                self.format_amount(inv.l10n_ar_currency_rate, padding=10, decimals=6),
+                # Ventas/Compras - Campo 19: Cantidad de alícuotas de IVA
+                str(len(inv._get_vat())),
+                # Ventas/Compras - Campo 20: Código de operación. TODO: Hardcoded "0"
+                "0",
+            ]
+            if self.type == "purchase":
+                # Compras - Campo 21: Credito fiscal computable
+                row.append(self.format_amount(invoice_amounts["vat_amount"]))
+            # Ventas/Compras - Campo 21/22: Otros impuestos
+            row.append(self.format_amount(invoice_amounts["other_taxes_amount"]))
+            if self.type == "sale":
+                # Ventas: Campo 22: Vencimiento del comprobante
+                row.append(
+                    fields.Date.from_string(
+                        inv.invoice_date_due or inv.invoice_date
+                    ).strftime("%Y%m%d")
+                )
+                # TODO: Ver casos donde no hay vencimiento
+            if self.type == "purchase":
+                # Compras - Campo 23: CUIT Emisor / Corredor - # TODO: No implementado
+                row.append(self.format_amount(0, padding=11))
+                # Compras - Campo 24: Denominacion emisor / corredor - # TODO: No implementado
+                row.append("".ljust(30, " ")[:30])
+                # Compras - Campo 25: IVA Comision - # TODO: No implementado
+                row.append(self.format_amount(0))
+            result.append("".join(row))
+        self.REGDIGITAL_CV_CBTE = "\r\n".join(result)
 
     def _check_partners(self, invoices):
         if self.type == "purchase":
@@ -407,225 +382,66 @@ class AccountVatLedger(models.Model):
                 or not r.vat
             )
             if partners:
+                partner_list = "\r\n".join(
+                    [f"[{p.id}] {p.display_name}" for p in partners]
+                )
                 raise ValidationError(
                     _(
                         "On purchase digital, partner document type is mandatory "
                         "and it must be different from 99. "
                         "Partners: \r\n\r\n"
-                        "%s"
-                    )
-                    % "\r\n".join(
-                        ["[%i] %s" % (p.id, p.display_name) for p in partners]
+                        f"{partner_list}"
                     )
                 )
 
-    def _get_aliquots(self, inv):
-        vat_taxes = []
-        vat_exempt_base_amount = 0
-        if inv.l10n_latam_document_type_id.code not in ["11", "12", "13"]:
-            for invl in inv.invoice_line_ids:
-                for tax in invl.tax_ids:
-                    if tax.tax_group_id.l10n_ar_vat_afip_code not in ["1", "2"]:
-                        if tax.id not in vat_taxes:
-                            vat_taxes.append(tax.id)
-                    if self.type == "purchase":
-                        if tax.amount == 0:
-                            vat_exempt_base_amount += invl.price_subtotal
-        return len(vat_taxes)
+    def format_amount(self, amount, padding=15, decimals=2):
+        template = amount < 0 and "-{:0>%dd}" % (padding - 1) or "{:0>%dd}" % (padding)
+        return template.format(int(round(abs(amount) * 10**decimals, decimals)))
 
-    def get_REGDIGITAL_CV_CBTE(self):
+    def get_digital_invoices(self, return_skiped=False):
         self.ensure_one()
-        res = []
-        invoices = self.get_digital_invoices().filtered(lambda r: r.state != "cancel")
-        self._check_partners(invoices)
+        return self.env["account.move"].search(
+            [
+                ("l10n_latam_document_type_id.export_to_digital", "=", True),
+                ("id", "in", self.invoice_ids.ids),
+            ],
+            order="invoice_date asc",
+        )
+        # if self.digital_skip_lines:
+        #     skip_lines = literal_eval(self.digital_skip_lines)
+        #     if isinstance(skip_lines, int):
+        #         skip_lines = [skip_lines]
+        #     to_skip = invoices.browse()
+        #     for line in skip_lines:
+        #         to_skip += invoices[line - 1]
+        #     if return_skiped:
+        #         return to_skip
+        #     invoices -= to_skip
+        # return invoices
 
-        for inv in invoices:
-            qty_ali = self._get_aliquots(inv)
-            currency_rate = inv.l10n_ar_currency_rate
-            currency_code = inv.currency_id.l10n_ar_afip_code
-            doc_number = int(inv.name.split("-")[2])
-            amounts = inv._l10n_ar_get_amounts()
+    def get_partner_document_code(self, partner):
+        if partner.l10n_ar_afip_responsibility_type_id.code == "5":
+            return str(
+                partner.l10n_latam_identification_type_id.l10n_ar_afip_code
+            ).zfill(2)
+        return "80"
 
-            row = [
-                # Campo 1: Fecha de comprobante
-                fields.Date.from_string(inv.invoice_date).strftime("%Y%m%d"),
-                # Campo 2: Tipo de Comprobante.
-                "{:0>3d}".format(int(inv.l10n_latam_document_type_id.code)),
-                # Campo 3: Punto de Venta
-                self.get_point_of_sale(inv),
-                # Campo 4: Número de Comprobante
-                "{:0>20d}".format(doc_number),
-            ]
+    def get_partner_document_number(self, partner):
+        number = partner.vat
+        if partner.l10n_ar_afip_responsibility_type_id.code == "5":
+            number = re.sub("[^0-9]", "", number or "")
+        if number is not False:
+            return number.rjust(20, "0")
+        else:
+            raise ValidationError(
+                _(
+                    f"""Partner {partner.name} has not
+                    CUIT/CUIL or DNI. Required
+                    for VAT Ledger Book."""
+                )
+            )
 
-            if self.type == "sale":
-                # Campo 5: Número de Comprobante Hasta.
-                row.append("{:0>20d}".format(doc_number))
-            else:
-                # Campo 5: Despacho de importación
-                if inv.l10n_latam_document_type_id.code == "66":
-                    row.append(
-                        (inv.l10n_latam_document_number or inv.number or "").rjust(
-                            16, "0"
-                        )
-                    )
-                else:
-                    row.append("".rjust(16, " "))
-
-            row += [
-                # Campo 6: Código de documento del comprador.
-                self.get_partner_document_code(inv.commercial_partner_id),
-                # Campo 7: Número de Identificación del comprador
-                self.get_partner_document_number(inv.commercial_partner_id),
-                # Campo 8: Apellido y Nombre del comprador.
-                inv.commercial_partner_id.name.ljust(30, " ")[:30],
-                # Campo 9: Importe Total de la Operación.
-                self.format_amount(inv.amount_total, invoice=inv),
-            ]
-
-            if self.type == "sale":
-                row += [
-                    # Campo 10: Importe total de conceptos que no integran el
-                    # precio neto gravado
-                    self.format_amount(amounts["vat_untaxed_base_amount"], invoice=inv),
-                    # Campo 11: Percepción a no categorizados TODO
-                    self.format_amount(0, invoice=inv),
-                    # Campo 12: Importe de operaciones exentas
-                    self.format_amount(amounts["vat_exempt_base_amount"], invoice=inv),
-                    # Campo 13: Importe de percepciones o pagos a cuenta de
-                    # impuestos nacionales TODO
-                    self.format_amount(0, invoice=inv),
-                    # Campo 14: Importe de percepciones de ingresos brutos
-                    self.format_amount(amounts["iibb_perc_amount"], invoice=inv),
-                ]
-            else:
-                row += [
-                    # Campo 10: Importe total de conceptos que no integran el
-                    # precio neto gravado
-                    self.format_amount(amounts["vat_untaxed_base_amount"], invoice=inv),
-                    # Campo 11: Importe de operaciones exentas
-                    self.format_amount(amounts["vat_exempt_base_amount"], invoice=inv),
-                    # Campo 12: Importe de percepciones o pagos a cuenta del
-                    # Impuesto al Valor Agregado
-                    self.format_amount(amounts["vat_perc_amount"], invoice=inv),
-                    # Campo 13: Importe de percepciones o pagos a cuenta de
-                    # impuestos nacionales TODO
-                    self.format_amount(0, invoice=inv),
-                    # Campo 14: Importe de percepciones de ingresos brutos
-                    self.format_amount(amounts["iibb_perc_amount"], invoice=inv),
-                ]
-
-            row += [
-                # Campo 15: Importe de percepciones de impuestos municipales
-                self.format_amount(amounts["mun_perc_amount"], invoice=inv),
-                # Campo 16: Importe de impuestos internos
-                self.format_amount(amounts["intern_tax_amount"], invoice=inv),
-                # Campo 17: Código de Moneda
-                str(currency_code),
-                # Campo 18: Tipo de Cambio
-                self.format_amount(currency_rate, padding=10, decimals=6),
-                # Campo 19: Cantidad de alícuotas de IVA
-                str(qty_ali),
-                # Campo 20: Código de operación.
-                # WARNING. segun la plantilla es 0 si no es ninguna
-                # TODO ver que no se informe un codigo si no correpsonde,
-                # tal vez da error
-                # TODO ADIVINAR E IMPLEMENTAR, VA A DAR ERROR
-                # inv.fiscal_position_id.afip_code or '0',
-                "0",
-            ]
-
-            if self.type == "sale":
-                row += [
-                    # Campo 21: Otros Tributos
-                    self.format_amount(amounts["other_taxes_amount"], invoice=inv),
-                    # Campo 22: Vencimiento comprobante
-                    (
-                        inv.l10n_latam_document_type_id.code
-                        in [
-                            "19",
-                            "20",
-                            "21",
-                            "16",
-                            "55",
-                            "81",
-                            "82",
-                            "83",
-                            "110",
-                            "111",
-                            "112",
-                            "113",
-                            "114",
-                            "115",
-                            "116",
-                            "117",
-                            "118",
-                            "119",
-                            "120",
-                            "201",
-                            "202",
-                            "203",
-                            "206",
-                            "207",
-                            "208",
-                            "211",
-                            "212",
-                            "213",
-                        ]
-                        and "00000000"
-                        or fields.Date.from_string(
-                            inv.invoice_date_due or inv.invoice_date
-                        ).strftime("%Y%m%d")
-                    ),
-                ]
-            else:
-                # Campo 21: Crédito Fiscal Computable
-                if self.prorate_tax_credit:
-                    if self.prorate_type == "global":
-                        row.append(self.format_amount(0, invoice=inv))
-                    else:
-                        # row.append(self.format_amount(0))
-                        # por ahora no implementado pero seria lo mismo que
-                        # sacar si prorrateo y que el cliente entre en el digital
-                        # en cada comprobante y complete cuando es en
-                        # credito fiscal computable
-                        raise ValidationError(
-                            _(
-                                "Para utilizar el prorrateo por comprobante:\n"
-                                '1) Exporte los archivos sin la opción "Proratear '
-                                'Crédito de Impuestos"\n2) Importe los mismos '
-                                "en el aplicativo\n3) En el aplicativo de afip, "
-                                "comprobante por comprobante, indique el valor "
-                                'correspondiente en el campo "Crédito Fiscal '
-                                'Computable"'
-                            )
-                        )
-                else:
-                    imp_neto = 0
-                    imp_liquidado = 0
-                    for mvl_tax in inv.l10n_latam_tax_ids:
-                        tax_group_id = mvl_tax.tax_group_id
-                        if tax_group_id.l10n_ar_vat_afip_code in [3, 4, 5, 6, 8, 9]:
-                            imp_neto += mvl_tax.tax_base_amount
-                            imp_liquidado += mvl_tax.price_subtotal
-                    row.append(self.format_amount(round(imp_liquidado, 2), invoice=inv))
-
-                row += [
-                    # Campo 22: Otros Tributos
-                    self.format_amount(amounts["other_taxes_amount"], invoice=inv),
-                    # TODO Implementar Campo 23, 24 y 25
-                    # Campo 23: CUIT Emisor / Corredor
-                    # Se informará sólo si en el campo "Tipo de Comprobante" se
-                    # consigna '033', '058', '059', '060' ó '063'. Si para
-                    # éstos comprobantes no interviene un tercero en la
-                    # operación, se consignará la C.U.I.T. del informante. Para
-                    # el resto de los comprobantes se completará con ceros
-                    self.format_amount(0, padding=11, invoice=inv),
-                    # Campo 24: Denominación Emisor / Corredor
-                    "".ljust(30, " ")[:30],
-                    # Campo 25: IVA Comisión
-                    # Si el campo 23 es distinto de cero se consignará el
-                    # importe del I.V.A. de la comisión
-                    self.format_amount(0, invoice=inv),
-                ]
-            res.append("".join(row))
-        self.REGDIGITAL_CV_CBTE = "\r\n".join(res)
+    def get_point_of_sale(self, invoice):
+        if self.type == "sale":
+            return "{:0>5d}".format(invoice.journal_id.l10n_ar_afip_pos_number)
+        return invoice.l10n_latam_document_number[:5]
