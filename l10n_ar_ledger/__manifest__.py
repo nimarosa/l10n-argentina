@@ -2,7 +2,7 @@
 # directory or check the readme files
 
 {
-    "name": "VAT Ledger for Argentina",
+    "name": "Vat Ledger - Argentina",
     "version": "14.0.0.0.2",
     "category": "Accounting",
     "license": "AGPL-3",
@@ -14,7 +14,7 @@
     "data": [
         "security/ir.model.access.csv",
         "security/security.xml",
-        "views/account_vat_ledger.xml",
+        "views/account_vat_ledger_views.xml",
     ],
     "maintainers": ["nimarosa", "ibuioli"],
     "installable": True,
